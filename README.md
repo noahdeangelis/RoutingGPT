@@ -64,7 +64,7 @@ In routing attention:
 ```
 Q: T
 K: 0.25T
-K: 0.25T
+V: 0.25T
 Attention: T * 0.25T
 ```
 
