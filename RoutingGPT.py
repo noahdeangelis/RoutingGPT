@@ -17,11 +17,11 @@ NUM_LAYERS = 8
 MAX_SEQ_LEN = 512
 TOP_K_RATIO = 0.25 # Keep the top 25% of tokens as attention keys/values.
 USE_AMP = False # Use AMP for faster training and lower memory usage (if supported by your GPU).
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 LEARNING_RATE = 3e-4
 MIN_LR = 3e-5
 TRAIN_STEPS = 25000
-USE_COMPILE = True # torch.compile
+USE_COMPILE = False # torch.compile
 
 #
 # Device stuff
@@ -58,8 +58,13 @@ class RoutingAttention(nn.Module):
 
         # num_kv_tokens = max(2, int(T * self.top_k_ratio)) # Calculate the number of tokens to attend to based on the top_k_ratio
         num_kv_tokens = min(T, max(2, int(T * self.top_k_ratio)))
+
         route_logits = self.router(x).squeeze(-1) # [B, T, 1] -> [B, T]
-        _, topk_indices = torch.topk(route_logits, num_kv_tokens, dim=-1) # [B, num_kv_tokens]
+        route_weights = F.softmax(route_logits, dim=-1)
+        _, topk_indices = torch.topk(route_logits, num_kv_tokens, dim=-1)
+        hard_mask = torch.zeros_like(route_logits).scatter(1, topk_indices, 1.0)
+        ste_weights = hard_mask + route_weights - route_weights.detach()
+        selected_weights = torch.gather(ste_weights, 1, topk_indices)
 
         # Project to Q, K, V
         q = self.q_proj(x)
@@ -67,15 +72,19 @@ class RoutingAttention(nn.Module):
         k = self.k_proj(selected_x)
         v = self.v_proj(selected_x)
 
-        # -> [B, H, T, D]
         q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, num_kv_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, num_kv_tokens, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # Now the router should actually learn
+        selected_weights = selected_weights.unsqueeze(1).unsqueeze(-1)
+        k = k * selected_weights
+        v = v * selected_weights
+
         # Causal mask
         # Prevent each query from attending to key/value tokens from the future.
         query_positions = torch.arange(T, device=x.device).view(1, 1, T, 1) # [1, 1, T, 1]
-        key_positions = (topk_indices.unsqueeze(1).unsqueeze(2))
+        key_positions = topk_indices.unsqueeze(1).unsqueeze(2)
         causal_mask = (key_positions <= query_positions)
 
         # Actually compute attention then merge heads and project back to the original embedding dimension.
@@ -205,13 +214,24 @@ def train(model, tokenizer, dataset, max_len, batch_size, learning_rate, train_s
             with torch.amp.autocast(DEVICE):
                 logits, loss = model(x, y)
             scaler.scale(loss).backward()
+
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
+
             scaler.update()
         else:
             logits, loss = model(x, y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         scheduler.step()
+
+        # if step % 100 == 0:
+        #     w = model.blocks[0].attn.router.weight
+        #     print("Router weight mean:", w.mean().item())
+        #     print("Router weight std :", w.std().item())
+        #     print("Router grad       :", None if w.grad is None else w.grad.abs().mean().item())
 
         end_time = time.time()
         elapsed_time = end_time - start_time
