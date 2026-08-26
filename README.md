@@ -74,9 +74,9 @@ Dense:
 16,384 × 16,384 = 268,435,456
 
 Routing:
-16,384 × 4,096 = 67,108,864
+16,384 × 8,192 = 134,217,728
 ```
-This is a 75% reduction in query key interactions.
+This is a 50% reduction in query key interactions.
 
 ---
 
